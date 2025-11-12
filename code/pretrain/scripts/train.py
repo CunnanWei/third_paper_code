@@ -1,0 +1,307 @@
+import os
+import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
+from torch.optim.lr_scheduler import LinearLR, CosineAnnealingWarmRestarts, SequentialLR
+import time
+import shutil
+import inspect
+import random
+import numpy as np
+import warnings
+import sys
+from pathlib import Path
+import wandb
+from datetime import datetime
+warnings.filterwarnings("ignore")
+sys.path.append(str(Path(__file__).resolve().parent.parent))
+
+from configs.config import Config
+from modules.dataset import ECGDataset_pretrain
+from modules.model import ECGPretrainModel
+from modules.trainer import Trainer
+
+def set_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+
+
+def init_distributed(config):
+    use_distributed = config.enable_distributed and torch.cuda.device_count() > 1
+    if not use_distributed:
+        return False, 0, 0
+    if not dist.is_initialized():
+        dist.init_process_group(backend=config.dist_backend)
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    torch.cuda.set_device(local_rank)
+    return True, local_rank, dist.get_rank()
+
+
+def _run_training_with_config(config=None):
+    if config is None:
+        config = Config()
+    use_distributed, local_rank, rank = init_distributed(config)
+    is_main_process = (not use_distributed) or rank == 0
+
+    if is_main_process:
+        print("\n" + "=" * 60)
+        print(f"{'Model Training Pipeline':^60}")
+        print("=" * 60)
+    seed = 42
+    set_seed(seed)
+    save_prefix = f"{str(datetime.now().strftime('%Y%m%d_%H%M%S'))}"
+    wandb_run = None
+    if config.enable_wandb and is_main_process:
+        wandb_run = wandb.init(
+            project=config.wandb_project,
+            name=save_prefix,
+            config={
+                "batch_size": config.batch_size,
+                "learning_rate": config.lr_rate,
+                "weight_decay": config.weight_decay,
+            },
+        )
+
+    if use_distributed:
+        device = torch.device("cuda", local_rank)
+    else:
+        device = torch.device(config.device)
+
+    if is_main_process:
+        print("\nCONFIGURATION")
+        print(f"  {'Batch size':18}: {config.batch_size}")
+        print(f"  {'Learning rate':18}: {config.lr_rate}")
+        print(f"  {'Weight Decay':18}: {config.weight_decay}")
+        print(f"  {'Device':18}: {device}")
+        print("\nPREPARING DATA...")
+
+    train_dataset = ECGDataset_pretrain(config, mode="train")
+    val_dataset = ECGDataset_pretrain(config, mode="val")
+
+    num_workers = 8
+
+    train_sampler = DistributedSampler(
+        train_dataset,
+        shuffle=True,
+    ) if use_distributed else None
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=config.batch_size,
+        shuffle=train_sampler is None,
+        sampler=train_sampler,
+        num_workers=num_workers,
+        pin_memory=True,
+        persistent_workers=True,
+        prefetch_factor=4,
+    )
+
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=config.batch_size,
+        shuffle=False,
+        pin_memory=True,
+        num_workers=num_workers,
+        persistent_workers=True,
+        prefetch_factor=4,
+    )
+
+    if is_main_process:
+        print(f"  {'Train samples':18}: {len(train_dataset)}")
+        print(f"  {'Val samples':18}: {len(val_dataset)}")
+
+    model = ECGPretrainModel(config).to(device)
+    if use_distributed:
+        model = DDP(model, device_ids=[local_rank], output_device=local_rank)
+
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=config.lr_rate, weight_decay=config.weight_decay
+    )
+
+    num_epochs = 30  # 大数据集下，每个epoch已经充分，30-50 epochs即可
+    warmup_epochs = 2  # 70万数据：2 epochs ≈ 1.1万steps，warmup充足
+
+    num_batches_per_epoch = len(train_loader)
+    warmup_steps = warmup_epochs * num_batches_per_epoch
+
+    # 使用step-based调度器，在每个batch后更新学习率
+    warmup_scheduler = LinearLR(
+        optimizer, 
+        start_factor=0.1,  # 从 lr*0.1 开始
+        total_iters=warmup_steps
+    )
+
+    # 动态计算T_0，让余弦周期与训练周期对齐
+    # 大数据集：warmup后分2-3个周期（第一周期10 epochs，后续倍增）
+    cosine_epochs_per_cycle = 10
+    T_0 = cosine_epochs_per_cycle * num_batches_per_epoch
+    
+    cosine_scheduler = CosineAnnealingWarmRestarts(
+        optimizer,
+        T_0=T_0,
+        T_mult=2,
+        eta_min=config.lr_rate * 0.01,  # 设为初始lr的1%
+    )
+
+    scheduler = SequentialLR(
+        optimizer,
+        schedulers=[warmup_scheduler, cosine_scheduler],
+        milestones=[warmup_steps],
+    )
+
+    # 添加混合精度训练支持
+    scaler = torch.amp.GradScaler(
+        "cuda") if torch.cuda.is_available() else None
+
+    trainer = Trainer(
+        model,
+        optimizer,
+        device,
+        scheduler=scheduler,
+        max_logit_scale=config.max_logit_scale,
+        is_main_process=is_main_process,
+    )
+
+    model_dir = os.path.join(
+        config.checkpoint_dir,
+        f"ckpt_{save_prefix}",
+    )
+
+    if is_main_process:
+        print("\n" + "-" * 60)
+        print(f"{'TRAINING STARTED':^60}")
+        print("-" * 60)
+
+    best_val_loss = float('inf')
+    best_mean_recall = 0.0  # 对比学习准确率作为主要指标
+    count_early_stop = 0
+    patience = 8  # 大数据集每个epoch成本高，给予更多耐心
+
+    for epoch in range(num_epochs):
+        epoch_start = time.time()
+        if train_sampler is not None:
+            train_sampler.set_epoch(epoch)
+        if is_main_process:
+            print(f"\nEpoch {epoch + 1}/{num_epochs}")
+
+        train_loss = trainer.train(train_loader, scaler=scaler)
+        val_metrics = trainer.validate(val_loader)
+        current_temperature = trainer.model_ref.clip.temperature.exp().item()
+
+        if is_main_process:
+            print(
+                "  Train loss: "
+                f"{train_loss:.4f}"
+            )
+            print(
+                "  Val loss: "
+                f"{val_metrics['loss']:.4f}"
+            )
+            print(
+                "  Text→ECG Top-1: "
+                f"{val_metrics['text_to_image_top1']*100:.2f}% | "
+                f"Top-5: {val_metrics['text_to_image_top5']*100:.2f}%"
+            )
+            print(
+                "  ECG→Text Top-1: "
+                f"{val_metrics['image_to_text_top1']*100:.2f}% | "
+                f"Top-5: {val_metrics['image_to_text_top5']*100:.2f}%"
+            )
+            print(
+                "  Mean Recall: "
+                f"{val_metrics['mean_recall']*100:.2f}%"
+            )
+        if wandb_run is not None and is_main_process:
+            wandb_run.log(
+                {
+                    # "epoch": epoch + 1,
+                    "train/loss": train_loss,
+                    "val/loss": val_metrics["loss"],
+                    "val/text_to_ecg_top1": val_metrics["text_to_image_top1"],
+                    "val/text_to_ecg_top5": val_metrics["text_to_image_top5"],
+                    "val/ecg_to_text_top1": val_metrics["image_to_text_top1"],
+                    "val/ecg_to_text_top5": val_metrics["image_to_text_top5"],
+                    "val/mean_recall": val_metrics["mean_recall"],
+                    "optimizer/lr": optimizer.param_groups[0]["lr"],
+                    "clip/temperature": current_temperature,
+                },
+                step=epoch + 1,
+            )
+
+        if epoch == 0 and is_main_process:
+            model_dir = os.path.join(
+                config.checkpoint_dir,
+                f"ckpt_{save_prefix}",
+            )
+            os.makedirs(model_dir, exist_ok=True)
+            shutil.copy2(
+                inspect.getfile(trainer.model_ref.__class__), os.path.join(
+                    model_dir, "model.py")
+            )
+            print(f"Model snapshot directory created: {model_dir}")
+
+        # 使用 Mean Recall 作为主要指标（对比学习准确率）
+        current_mean_recall = val_metrics['mean_recall']
+        if current_mean_recall > best_mean_recall:
+            best_mean_recall = current_mean_recall
+            best_val_loss = val_metrics['loss']
+            if is_main_process:
+                torch.save(trainer.model_ref.state_dict(), os.path.join(
+                    model_dir, "weights.pth"))
+                print(
+                    f"  Model saved! (Best Mean Recall: {best_mean_recall*100:.2f}%)")
+            count_early_stop = 0
+        else:
+            count_early_stop += 1
+            if is_main_process:
+                print(f"  Early stopping count: {count_early_stop}/{patience}")
+            if count_early_stop >= patience:
+                if is_main_process:
+                    print(f"  Early stopping triggered at epoch {epoch + 1}.")
+                    print(f"  Best Mean Recall: {best_mean_recall*100:.2f}%")
+                    print(f"  Best Val Loss: {best_val_loss:.4f}")
+                    print(f"  Weights saved at: {model_dir}")
+                break
+
+    if wandb_run is not None and is_main_process:
+        wandb_run.alert(title="训练结束", text=f"Best Mean Recall: {best_mean_recall*100:.2f}%")
+        wandb_run.finish()
+
+    if use_distributed:
+        dist.barrier()
+        dist.destroy_process_group()
+
+
+def _distributed_worker(rank, world_size, config):
+    os.environ["LOCAL_RANK"] = str(rank)
+    os.environ["RANK"] = str(rank)
+    os.environ["WORLD_SIZE"] = str(world_size)
+    _run_training_with_config(config)
+
+
+def main():
+    config = Config()
+    world_size = torch.cuda.device_count()
+    has_torchrun_env = "LOCAL_RANK" in os.environ and "WORLD_SIZE" in os.environ
+    should_spawn = config.enable_distributed and world_size > 1 and not has_torchrun_env
+
+    if should_spawn:
+        os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+        os.environ.setdefault("MASTER_PORT", "29500")
+        mp.spawn(_distributed_worker, nprocs=world_size, args=(world_size, config))
+    else:
+        os.environ.setdefault("LOCAL_RANK", "0")
+        os.environ.setdefault("RANK", "0")
+        os.environ.setdefault("WORLD_SIZE", "1")
+        _run_training_with_config(config)
+
+
+if __name__ == "__main__":
+    main()
