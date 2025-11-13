@@ -1,8 +1,13 @@
 import torch
+import torch.nn.functional as F
 from torch.autograd import Function
 import torch.distributed as distributed
 
 from einops import rearrange
+
+# 辅助函数
+def exists(val):
+    return val is not None
 
 def pad_dim_to(t, length, dim = 0):
     pad_length = length - t.shape[dim]

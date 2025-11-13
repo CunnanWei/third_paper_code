@@ -38,16 +38,13 @@ class ECGPretrainModel(nn.Module):
     def forward(self, ecg, input_ids):
         # CLIP内部会根据text_pad_id自动计算mask (text_mask = text != pad_token_id)
         # 对于标准tokenizer，这与预先生成的attention_mask等价
+        # 
+        # 注意：x_clip在eval模式下不支持return_loss=True (会触发assert)
+        # 验证时的loss计算在trainer.py中通过return_latents=True手动完成
         if self.training:
             return self.clip(input_ids, ecg, return_loss=True)
         else:
-            # eval模式下，获取相似度矩阵并手动计算对比损失
-            sim = self.clip(input_ids, ecg, return_loss=False)
-            batch_size = sim.shape[0]
-            labels = torch.arange(batch_size, device=sim.device)
-            loss = (F.cross_entropy(sim, labels) +
-                    F.cross_entropy(sim.t(), labels)) / 2
-            return loss
+            return self.clip(input_ids, ecg, return_loss=False)
 
 
 if __name__ == "__main__":

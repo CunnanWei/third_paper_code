@@ -5,12 +5,14 @@ from pathlib import Path
 class Config:
     def __init__(self):
         current_file_path = Path(__file__).resolve()
-        # 数据集根目录：指向 /home/jasonwei/projects/datasets
-        self.data_prefix_root = str(current_file_path.parents[3].parent / "datasets")
-        # 检查点目录：当前pretrain目录下的checkpoints_pretrain
+        # 项目根目录：third_paper_code/
+        project_root = current_file_path.parents[3]
+        # 数据集目录：third_paper_code/datasets/
+        self.data_prefix_root = str(project_root / "datasets")
+        # 检查点目录：third_paper_code/code/pretrain/checkpoints_pretrain/
         self.checkpoint_dir = str(current_file_path.parents[1] / "checkpoints_pretrain")
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.enable_distributed = False
+        self.enable_distributed = True  # 启用DDP多卡训练
         self.dist_backend = "nccl"
 
         ### pretrain相关配置

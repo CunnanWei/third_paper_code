@@ -1,5 +1,6 @@
 import torch
 from tqdm import tqdm
+import torch.distributed as dist
 
 
 class Trainer:
@@ -132,7 +133,7 @@ class Trainer:
                 sim = text_latents @ image_latents.t()
                 sim = sim * self.model_ref.clip.temperature.exp()
 
-                # 手动计算loss（与model.py中eval模式一致）
+                # 手动计算loss
                 batch_size = sim.shape[0]
                 labels = torch.arange(batch_size, device=sim.device)
                 loss = (torch.nn.functional.cross_entropy(sim, labels) +
@@ -175,12 +176,36 @@ class Trainer:
         if processed_samples == 0:
             return {"loss": 0.0}
 
+        # 在DDP模式下，聚合所有进程的总和，然后计算全局平均
+        if dist.is_initialized():
+            # 聚合分子和分母
+            stats_tensor = torch.tensor([
+                total_loss,
+                total_t2i_top1,
+                total_t2i_top5,
+                total_i2t_top1,
+                total_i2t_top5,
+                processed_samples
+            ], dtype=torch.float32, device=self.device)
+            
+            dist.all_reduce(stats_tensor, op=dist.ReduceOp.SUM)
+            
+            # 解包聚合后的统计数据
+            total_loss = stats_tensor[0].item()
+            total_t2i_top1 = stats_tensor[1].item()
+            total_t2i_top5 = stats_tensor[2].item()
+            total_i2t_top1 = stats_tensor[3].item()
+            total_i2t_top5 = stats_tensor[4].item()
+            processed_samples = stats_tensor[5].item()
+
+        # 计算全局指标
         metrics = {
             "loss": total_loss / processed_samples,
             "text_to_image_top1": total_t2i_top1 / processed_samples,
             "text_to_image_top5": total_t2i_top5 / processed_samples,
             "image_to_text_top1": total_i2t_top1 / processed_samples,
             "image_to_text_top5": total_i2t_top5 / processed_samples,
-            "mean_recall": (total_t2i_top1/processed_samples + total_i2t_top1/processed_samples) / 2,
+            "mean_recall": (total_t2i_top1 + total_i2t_top1) / (2 * processed_samples),
         }
+
         return metrics

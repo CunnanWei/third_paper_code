@@ -1,22 +1,24 @@
 import os
 import torch
 import torch.distributed as dist
-import torch.multiprocessing as mp
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from torch.optim.lr_scheduler import LinearLR, CosineAnnealingWarmRestarts, SequentialLR
 import time
-import shutil
-import inspect
 import random
 import numpy as np
 import warnings
 import sys
+import logging
 from pathlib import Path
 import wandb
 from datetime import datetime
+
+# 抑制常见警告
 warnings.filterwarnings("ignore")
+warnings.filterwarnings("ignore", category=UserWarning, module="pydantic")
+logging.getLogger("torch.distributed.distributed_c10d").setLevel(logging.ERROR)
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 
 from configs.config import Config
@@ -92,6 +94,12 @@ def _run_training_with_config(config=None):
         shuffle=True,
     ) if use_distributed else None
 
+    # 为验证集也添加DistributedSampler，确保DDP模式下每个进程验证不同的数据子集
+    val_sampler = DistributedSampler(
+        val_dataset,
+        shuffle=False,  # 验证时不需要shuffle
+    ) if use_distributed else None
+
     train_loader = DataLoader(
         train_dataset,
         batch_size=config.batch_size,
@@ -101,16 +109,19 @@ def _run_training_with_config(config=None):
         pin_memory=True,
         persistent_workers=True,
         prefetch_factor=4,
+        drop_last=True,
     )
 
     val_loader = DataLoader(
         val_dataset,
         batch_size=config.batch_size,
-        shuffle=False,
+        shuffle=False,  # 验证集不需要shuffle
+        sampler=val_sampler,
         pin_memory=True,
         num_workers=num_workers,
         persistent_workers=True,
         prefetch_factor=4,
+        drop_last=True,  # DDP模式下保持各进程batch数量一致
     )
 
     if is_main_process:
@@ -119,13 +130,19 @@ def _run_training_with_config(config=None):
 
     model = ECGPretrainModel(config).to(device)
     if use_distributed:
-        model = DDP(model, device_ids=[local_rank], output_device=local_rank)
+        # find_unused_parameters=True: 允许部分参数不参与梯度计算（如TextEncoder冻结层）
+        model = DDP(
+            model, 
+            device_ids=[local_rank], 
+            output_device=local_rank,
+            find_unused_parameters=True
+        )
 
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=config.lr_rate, weight_decay=config.weight_decay
     )
 
-    num_epochs = 30  # 大数据集下，每个epoch已经充分，30-50 epochs即可
+    num_epochs = 50  # 大数据集下，每个epoch已经充分，30-50 epochs即可
     warmup_epochs = 2  # 70万数据：2 epochs ≈ 1.1万steps，warmup充足
 
     num_batches_per_epoch = len(train_loader)
@@ -169,6 +186,7 @@ def _run_training_with_config(config=None):
         is_main_process=is_main_process,
     )
 
+    # 提前定义模型保存目录，所有进程使用相同路径
     model_dir = os.path.join(
         config.checkpoint_dir,
         f"ckpt_{save_prefix}",
@@ -186,14 +204,22 @@ def _run_training_with_config(config=None):
 
     for epoch in range(num_epochs):
         epoch_start = time.time()
+        # 为训练sampler设置epoch，确保每个epoch数据分布不同
         if train_sampler is not None:
             train_sampler.set_epoch(epoch)
+        # 为验证sampler也设置epoch，保证DDP模式下数据分片的确定性
+        if val_sampler is not None:
+            val_sampler.set_epoch(epoch)
         if is_main_process:
             print(f"\nEpoch {epoch + 1}/{num_epochs}")
 
         train_loss = trainer.train(train_loader, scaler=scaler)
         val_metrics = trainer.validate(val_loader)
         current_temperature = trainer.model_ref.clip.temperature.exp().item()
+
+        # 在评估和保存模型前同步所有进程
+        if use_distributed:
+            dist.barrier()
 
         if is_main_process:
             print(
@@ -235,17 +261,14 @@ def _run_training_with_config(config=None):
                 step=epoch + 1,
             )
 
+        # 只在第一个epoch创建模型保存目录
         if epoch == 0 and is_main_process:
-            model_dir = os.path.join(
-                config.checkpoint_dir,
-                f"ckpt_{save_prefix}",
-            )
             os.makedirs(model_dir, exist_ok=True)
-            shutil.copy2(
-                inspect.getfile(trainer.model_ref.__class__), os.path.join(
-                    model_dir, "model.py")
-            )
             print(f"Model snapshot directory created: {model_dir}")
+
+        # 确保目录创建完成后再继续
+        if use_distributed:
+            dist.barrier()
 
         # 使用 Mean Recall 作为主要指标（对比学习准确率）
         current_mean_recall = val_metrics['mean_recall']
@@ -253,8 +276,19 @@ def _run_training_with_config(config=None):
             best_mean_recall = current_mean_recall
             best_val_loss = val_metrics['loss']
             if is_main_process:
-                torch.save(trainer.model_ref.state_dict(), os.path.join(
-                    model_dir, "weights.pth"))
+                # 保存完整checkpoint，包含训练状态
+                checkpoint = {
+                    'epoch': epoch,
+                    'model_state_dict': trainer.model_ref.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
+                    'best_mean_recall': best_mean_recall,
+                    'best_val_loss': best_val_loss,
+                    'config': config.__dict__
+                }
+                torch.save(checkpoint, os.path.join(model_dir, "best_checkpoint.pth"))
+                # 同时保存仅模型权重，方便单独加载
+                torch.save(trainer.model_ref.state_dict(), os.path.join(model_dir, "weights.pth"))
                 print(
                     f"  Model saved! (Best Mean Recall: {best_mean_recall*100:.2f}%)")
             count_early_stop = 0
@@ -279,28 +313,14 @@ def _run_training_with_config(config=None):
         dist.destroy_process_group()
 
 
-def _distributed_worker(rank, world_size, config):
-    os.environ["LOCAL_RANK"] = str(rank)
-    os.environ["RANK"] = str(rank)
-    os.environ["WORLD_SIZE"] = str(world_size)
-    _run_training_with_config(config)
-
-
 def main():
+    """
+    单机多卡训练入口
+    使用torchrun启动: torchrun --nproc_per_node=<GPU数量> scripts/train.py
+    单卡训练: python scripts/train.py
+    """
     config = Config()
-    world_size = torch.cuda.device_count()
-    has_torchrun_env = "LOCAL_RANK" in os.environ and "WORLD_SIZE" in os.environ
-    should_spawn = config.enable_distributed and world_size > 1 and not has_torchrun_env
-
-    if should_spawn:
-        os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
-        os.environ.setdefault("MASTER_PORT", "29500")
-        mp.spawn(_distributed_worker, nprocs=world_size, args=(world_size, config))
-    else:
-        os.environ.setdefault("LOCAL_RANK", "0")
-        os.environ.setdefault("RANK", "0")
-        os.environ.setdefault("WORLD_SIZE", "1")
-        _run_training_with_config(config)
+    _run_training_with_config(config)
 
 
 if __name__ == "__main__":

@@ -2,17 +2,20 @@ import numpy as np
 import pandas as pd
 import torch
 from torch.utils.data import Dataset
+from pathlib import Path
 
 
 class ECGDataset_pretrain(Dataset):
     def __init__(self, config, mode="train"):
         self.config = config
         self.mode = mode
+        # 保存项目根目录，用于构建数据文件的绝对路径
+        self.project_root = Path(config.data_prefix_root).parent
 
         if self.mode == "train":
-            self.csv_path = "datasets/pretrain/train.csv"
+            self.csv_path = f"{config.data_prefix_root}/pretrain/train.csv"
         elif self.mode == "val":
-            self.csv_path = "datasets/pretrain/val.csv"
+            self.csv_path = f"{config.data_prefix_root}/pretrain/val.csv"
 
         self.csv_data = pd.read_csv(self.csv_path, usecols=['path', 'report_tokenize_path'])
 
@@ -22,9 +25,9 @@ class ECGDataset_pretrain(Dataset):
 
 
     def __getitem__(self, idx):
-        ecg_path = self.csv_data.iloc[idx]["path"]
-        tokenize_output_path= self.csv_data.iloc[idx]["report_tokenize_path"]
-        
+        # CSV中的路径是相对路径，需要拼接项目根目录
+        ecg_path = self.project_root / self.csv_data.iloc[idx]["path"]
+        tokenize_output_path = self.project_root / self.csv_data.iloc[idx]["report_tokenize_path"]
 
         ecg = torch.from_numpy(np.load(ecg_path))
         tokenize_output = np.load(tokenize_output_path)
