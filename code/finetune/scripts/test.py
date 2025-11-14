@@ -45,7 +45,7 @@ def main(dataset_name):
     )
 
     # 根据数据集名称查找对应的weights.pth路径
-    base_path = "/home/jasonwei/projects/third_paper_code/code/finetune/checkpoints_finetune/model_snapshots/vim1d/"
+    base_path = os.path.join(config.checkpoint_dir, "model_snapshots", "vim1d")
     checkpoint_path = os.path.join(base_path, dataset_name, "weights.pth")
 
     if not os.path.exists(checkpoint_path):

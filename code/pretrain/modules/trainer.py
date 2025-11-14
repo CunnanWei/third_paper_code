@@ -1,6 +1,7 @@
 import torch
 from tqdm import tqdm
 import torch.distributed as dist
+from torch.cuda.amp import autocast
 
 
 class Trainer:
@@ -10,21 +11,14 @@ class Trainer:
         optimizer,
         device,
         scheduler=None,
-        max_logit_scale=4.605170185988092,
         is_main_process=True,
     ):
         self.model = model
         self.optimizer = optimizer
         self.device = device
         self.scheduler = scheduler
-        self.max_logit_scale = max_logit_scale
         self.is_main_process = is_main_process
         self.model_ref = self.model.module if hasattr(self.model, "module") else self.model
-        self.clip_temperature = self.model_ref.clip.temperature
-        self._clamp_temperature()
-
-    def _clamp_temperature(self):
-        self.clip_temperature.data.clamp_(max=self.max_logit_scale)
 
     def _step_scheduler(self):
         if self.scheduler is not None:
@@ -57,7 +51,7 @@ class Trainer:
 
             # 使用混合精度训练
             if scaler is not None:
-                with torch.amp.autocast("cuda"):
+                with autocast():
                     loss = self.model(*model_inputs)
 
                 # 反向传播
@@ -67,7 +61,6 @@ class Trainer:
                 torch.nn.utils.clip_grad_norm_(
                     self.model.parameters(), max_norm=1.0)
                 scaler.step(self.optimizer)
-                self._clamp_temperature()
                 scaler.update()
             else:
                 loss = self.model(*model_inputs)
@@ -78,7 +71,6 @@ class Trainer:
                 torch.nn.utils.clip_grad_norm_(
                     self.model.parameters(), max_norm=1.0)
                 self.optimizer.step()
-                self._clamp_temperature()
 
             self._step_scheduler()
 
@@ -89,10 +81,13 @@ class Trainer:
 
             # 更新进度条
             if self.is_main_process:
+                current_temp = torch.exp(
+                    self.model_ref.clip.temperature.detach()
+                ).item()
                 pbar.set_postfix({
                     "loss": f"{stats['total_loss']/stats['processed_samples']:.4f}",
                     "lr": f"{self.optimizer.param_groups[0]['lr']:.2e}",
-                    "temp": f"{self.model_ref.clip.temperature.exp().item():.3f}",
+                    "temp": f"{current_temp:.3f}",
                 })
 
         avg_loss = stats["total_loss"] / stats["processed_samples"]
@@ -131,7 +126,7 @@ class Trainer:
                     return_latents=True,
                 )
                 sim = text_latents @ image_latents.t()
-                sim = sim * self.model_ref.clip.temperature.exp()
+                sim = sim * torch.exp(self.model_ref.clip.temperature)
 
                 # 手动计算loss
                 batch_size = sim.shape[0]

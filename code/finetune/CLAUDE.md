@@ -55,7 +55,7 @@ python scripts/preprocess_data.py --dataset [dataset_name] --mode [train/val/tes
    - `test.py`: 测试脚本
    - `preprocess_data.py`: 数据预处理脚本
 
-5. **checkpoints_finetune/** - 模型检查点
+5. **checkpoints_finetune/**（与 `code/` 同级）- 模型检查点
    - `model_snapshots/vim1d/`: 按数据集组织的模型权重
 
 ### 数据流程
@@ -91,5 +91,5 @@ python scripts/preprocess_data.py --dataset [dataset_name] --mode [train/val/tes
 
 - 修改数据集路径请检查`configs/config.py`中的路径配置
 - 新增数据集需要在`modules/dataset.py`中添加相应的数据路径配置
-- 模型权重会自动保存到`checkpoints_finetune/model_snapshots/vim1d/`目录
+- 模型权重会自动保存到项目根目录的`checkpoints_finetune/model_snapshots/vim1d/`目录
 - 测试结果会保存到各数据集目录下的`test_metrics.txt`文件

@@ -9,6 +9,7 @@ import time
 from torch.optim.lr_scheduler import LinearLR, CosineAnnealingWarmRestarts
 from torch.utils.data import DataLoader
 import torch
+from torch.cuda.amp import GradScaler
 import os
 import sys
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -110,8 +111,7 @@ def main(dataset_name):
     )
 
     # 添加混合精度训练支持
-    scaler = torch.amp.GradScaler(
-        "cuda") if torch.cuda.is_available() else None
+    scaler = GradScaler() if torch.cuda.is_available() else None
 
     trainer = Trainer(
         model,

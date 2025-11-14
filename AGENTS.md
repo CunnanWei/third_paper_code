@@ -5,7 +5,7 @@
 - `code/pretrain/modules/`：模型、数据集与自定义层；`scripts/train.py` 是预训练入口，支持单机多卡。  
 - `datasets/`：按 `datasets/pretrain/{train,val}.csv` 及对应 `.npy/.npz` 存放输入；确保路径与 CSV 字段 `path`、`report_tokenize_path` 对齐。  
 - `notebooks/`：如 `precompute_ecg_video.py`、`tokenize.py`，用于离线特征/标注处理。  
-- `checkpoints_pretrain/`：训练权重输出目录，脚本首个 epoch 会创建 `ckpt_时间戳/` 并快照 `model.py`。
+- `checkpoints_pretrain/`（与 `code/` 同级）：训练权重输出目录，脚本首个 epoch 会创建 `ckpt_时间戳/` 并快照 `model.py`。
 
 ## 构建、测试与开发命令
 - 进入虚拟环境：`python -m venv .venv && source .venv/bin/activate`。  

@@ -5,20 +5,18 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from torch.optim.lr_scheduler import LinearLR, CosineAnnealingWarmRestarts, SequentialLR
+from torch.cuda.amp import GradScaler
 import time
 import random
 import numpy as np
 import warnings
 import sys
-import logging
 from pathlib import Path
-import wandb
+import swanlab
 from datetime import datetime
 
-# 抑制常见警告
 warnings.filterwarnings("ignore")
-warnings.filterwarnings("ignore", category=UserWarning, module="pydantic")
-logging.getLogger("torch.distributed.distributed_c10d").setLevel(logging.ERROR)
+
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 
 from configs.config import Config
@@ -59,11 +57,11 @@ def _run_training_with_config(config=None):
     seed = 42
     set_seed(seed)
     save_prefix = f"{str(datetime.now().strftime('%Y%m%d_%H%M%S'))}"
-    wandb_run = None
-    if config.enable_wandb and is_main_process:
-        wandb_run = wandb.init(
-            project=config.wandb_project,
-            name=save_prefix,
+    swanlab_run = None
+    if config.enable_swanlab and is_main_process:
+        swanlab_run = swanlab.init(
+            project=config.swanlab_project,
+            experiment_name=save_prefix,
             config={
                 "batch_size": config.batch_size,
                 "learning_rate": config.lr_rate,
@@ -87,7 +85,7 @@ def _run_training_with_config(config=None):
     train_dataset = ECGDataset_pretrain(config, mode="train")
     val_dataset = ECGDataset_pretrain(config, mode="val")
 
-    num_workers = 8
+    num_workers = 12
 
     train_sampler = DistributedSampler(
         train_dataset,
@@ -108,7 +106,7 @@ def _run_training_with_config(config=None):
         num_workers=num_workers,
         pin_memory=True,
         persistent_workers=True,
-        prefetch_factor=4,
+        prefetch_factor=8,
         drop_last=True,
     )
 
@@ -120,7 +118,7 @@ def _run_training_with_config(config=None):
         pin_memory=True,
         num_workers=num_workers,
         persistent_workers=True,
-        prefetch_factor=4,
+        prefetch_factor=8,
         drop_last=True,  # DDP模式下保持各进程batch数量一致
     )
 
@@ -142,47 +140,51 @@ def _run_training_with_config(config=None):
         model.parameters(), lr=config.lr_rate, weight_decay=config.weight_decay
     )
 
-    num_epochs = 50  # 大数据集下，每个epoch已经充分，30-50 epochs即可
-    warmup_epochs = 2  # 70万数据：2 epochs ≈ 1.1万steps，warmup充足
+    num_epochs = 100  # 大数据集下，每个epoch已经充分，30-50 epochs即可
 
     num_batches_per_epoch = len(train_loader)
-    warmup_steps = warmup_epochs * num_batches_per_epoch
+    total_steps = max(1, num_epochs * num_batches_per_epoch)
 
-    # 使用step-based调度器，在每个batch后更新学习率
+    # 预热步数按总步数比例自适应，并限制在 [1, 4000] 内
+    warmup_ratio = 0.03
+    warmup_steps = int(total_steps * warmup_ratio)
+    warmup_cap = min(int(total_steps * 0.05), 4000)
+    warmup_steps = max(1, min(warmup_steps, warmup_cap))
+    if warmup_steps >= total_steps:
+        warmup_steps = max(1, total_steps - 1)
+
     warmup_scheduler = LinearLR(
-        optimizer, 
-        start_factor=0.1,  # 从 lr*0.1 开始
-        total_iters=warmup_steps
+        optimizer,
+        start_factor=0.01,
+        total_iters=warmup_steps,
     )
 
-    # 动态计算T_0，让余弦周期与训练周期对齐
-    # 大数据集：warmup后分2-3个周期（第一周期10 epochs，后续倍增）
-    cosine_epochs_per_cycle = 10
-    T_0 = cosine_epochs_per_cycle * num_batches_per_epoch
-    
+    # 余弦部分按总剩余步数平均切成 2-3 个周期，使重启节奏随训练规模调整
+    remaining_steps = max(1, total_steps - warmup_steps)
+    cosine_cycles = 3 if num_epochs >= 60 else 2 if num_epochs >= 30 else 1
+    steps_per_cycle = max(1, remaining_steps // cosine_cycles)
+
     cosine_scheduler = CosineAnnealingWarmRestarts(
         optimizer,
-        T_0=T_0,
-        T_mult=2,
-        eta_min=config.lr_rate * 0.01,  # 设为初始lr的1%
+        T_0=steps_per_cycle,
+        T_mult=1,
+        eta_min=config.lr_rate * 0.001,
     )
 
     scheduler = SequentialLR(
         optimizer,
         schedulers=[warmup_scheduler, cosine_scheduler],
-        milestones=[warmup_steps],
+        milestones=[warmup_steps - 1],
     )
 
     # 添加混合精度训练支持
-    scaler = torch.amp.GradScaler(
-        "cuda") if torch.cuda.is_available() else None
+    scaler = GradScaler() if torch.cuda.is_available() else None
 
     trainer = Trainer(
         model,
         optimizer,
         device,
         scheduler=scheduler,
-        max_logit_scale=config.max_logit_scale,
         is_main_process=is_main_process,
     )
 
@@ -200,7 +202,7 @@ def _run_training_with_config(config=None):
     best_val_loss = float('inf')
     best_mean_recall = 0.0  # 对比学习准确率作为主要指标
     count_early_stop = 0
-    patience = 8  # 大数据集每个epoch成本高，给予更多耐心
+    patience = 10  # 大数据集每个epoch成本高，给予更多耐心
 
     for epoch in range(num_epochs):
         epoch_start = time.time()
@@ -215,7 +217,7 @@ def _run_training_with_config(config=None):
 
         train_loss = trainer.train(train_loader, scaler=scaler)
         val_metrics = trainer.validate(val_loader)
-        current_temperature = trainer.model_ref.clip.temperature.exp().item()
+
 
         # 在评估和保存模型前同步所有进程
         if use_distributed:
@@ -244,8 +246,8 @@ def _run_training_with_config(config=None):
                 "  Mean Recall: "
                 f"{val_metrics['mean_recall']*100:.2f}%"
             )
-        if wandb_run is not None and is_main_process:
-            wandb_run.log(
+        if swanlab_run is not None and is_main_process:
+            swanlab_run.log(
                 {
                     # "epoch": epoch + 1,
                     "train/loss": train_loss,
@@ -255,10 +257,7 @@ def _run_training_with_config(config=None):
                     "val/ecg_to_text_top1": val_metrics["image_to_text_top1"],
                     "val/ecg_to_text_top5": val_metrics["image_to_text_top5"],
                     "val/mean_recall": val_metrics["mean_recall"],
-                    "optimizer/lr": optimizer.param_groups[0]["lr"],
-                    "clip/temperature": current_temperature,
-                },
-                step=epoch + 1,
+                }
             )
 
         # 只在第一个epoch创建模型保存目录
@@ -276,18 +275,6 @@ def _run_training_with_config(config=None):
             best_mean_recall = current_mean_recall
             best_val_loss = val_metrics['loss']
             if is_main_process:
-                # 保存完整checkpoint，包含训练状态
-                checkpoint = {
-                    'epoch': epoch,
-                    'model_state_dict': trainer.model_ref.state_dict(),
-                    'optimizer_state_dict': optimizer.state_dict(),
-                    'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
-                    'best_mean_recall': best_mean_recall,
-                    'best_val_loss': best_val_loss,
-                    'config': config.__dict__
-                }
-                torch.save(checkpoint, os.path.join(model_dir, "best_checkpoint.pth"))
-                # 同时保存仅模型权重，方便单独加载
                 torch.save(trainer.model_ref.state_dict(), os.path.join(model_dir, "weights.pth"))
                 print(
                     f"  Model saved! (Best Mean Recall: {best_mean_recall*100:.2f}%)")
@@ -301,12 +288,10 @@ def _run_training_with_config(config=None):
                     print(f"  Early stopping triggered at epoch {epoch + 1}.")
                     print(f"  Best Mean Recall: {best_mean_recall*100:.2f}%")
                     print(f"  Best Val Loss: {best_val_loss:.4f}")
-                    print(f"  Weights saved at: {model_dir}")
                 break
 
-    if wandb_run is not None and is_main_process:
-        wandb_run.alert(title="训练结束", text=f"Best Mean Recall: {best_mean_recall*100:.2f}%")
-        wandb_run.finish()
+    if swanlab_run is not None and is_main_process:
+        swanlab_run.finish()
 
     if use_distributed:
         dist.barrier()

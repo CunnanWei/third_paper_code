@@ -7,14 +7,14 @@
 - `scripts/`：可执行脚本（如 `train.py`）。
 - `configs/config.py`：路径与训练超参（如 `batch_size`、`lr_rate`、`enable_wandb`）。
 - `notebooks/`：数据预处理与实验脚本（如 `precompute_ecg_video.py`）。
-- `checkpoints_pretrain/`：训练权重输出目录（自动创建）。
+- `checkpoints_pretrain/`（项目根目录下，与 `code/` 同级）：训练权重输出目录（自动创建）。
 - 数据约定：数据集位于项目根目录下 `datasets/pretrain/`，CSV 包含 `path` 或 `video_path`、`total_report` 字段。
 
 ## 构建、测试与本地运行
 - 创建环境（示例）：`python -m venv .venv && source .venv/bin/activate`。
 - 安装依赖（最小集）：`pip install torch numpy pandas pyts tqdm wandb`。
 - 预处理ECG视频：`python notebooks/precompute_ecg_video.py`（更新 CSV 并生成 `datasets/pretrain/ecg_video/*.npy`）。
-- 训练：`python scripts/train.py`（内含训练与验证循环，权重保存到 `checkpoints_pretrain/`）。
+- 训练：`python scripts/train.py`（内含训练与验证循环，权重保存到项目根目录的 `checkpoints_pretrain/`）。
 - 关闭/开启 W&B：在 `configs/config.py` 设置 `enable_wandb=False/True`（或导出 `WANDB_DISABLED=true`）。
 
 ## 代码风格与命名
@@ -31,6 +31,5 @@
 - PR 要求：简述动机与变更点、给出运行命令与关键日志/截图、关联 Issue、说明是否影响配置与数据路径。
 
 ## 安全与配置提示（可选）
-- 请勿提交数据与大模型权重；建议将 `datasets/`、`checkpoints_pretrain/` 忽略在版本控制之外。
+- 请勿提交数据与大模型权重；建议将 `datasets/`、`checkpoints_pretrain/`（均位于项目根目录）忽略在版本控制之外。
 - 变更 `configs/config.py` 时，明确列出新增键的默认值与用途，避免破坏性更改。
-

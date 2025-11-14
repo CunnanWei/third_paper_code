@@ -9,7 +9,6 @@ class ECGDataset_pretrain(Dataset):
     def __init__(self, config, mode="train"):
         self.config = config
         self.mode = mode
-        # 保存项目根目录，用于构建数据文件的绝对路径
         self.project_root = Path(config.data_prefix_root).parent
 
         if self.mode == "train":
@@ -23,9 +22,7 @@ class ECGDataset_pretrain(Dataset):
         return len(self.csv_data)
 
 
-
     def __getitem__(self, idx):
-        # CSV中的路径是相对路径，需要拼接项目根目录
         ecg_path = self.project_root / self.csv_data.iloc[idx]["path"]
         tokenize_output_path = self.project_root / self.csv_data.iloc[idx]["report_tokenize_path"]
 

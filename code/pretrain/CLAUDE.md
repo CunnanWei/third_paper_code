@@ -54,7 +54,7 @@ Text Reports (Chinese) → MedCPT Encoder (partially frozen) → Projection → 
 **Path Management** (`configs/config.py`):
 - Hierarchical path construction from project root to dataset locations
 - Dataset root: `../../datasets` (relative to project structure)
-- Checkpoints: `./checkpoints_pretrain` (local to pretrain directory)
+- Checkpoints: `project_root/checkpoints_pretrain`（与 `code/` 同级）
 - Hardware adaptation: Automatic switching between dataset types based on GPU
 
 **Key Hyperparameters**:

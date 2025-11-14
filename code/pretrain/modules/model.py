@@ -1,3 +1,4 @@
+import math
 import torch.nn.functional as F
 import torch.nn as nn
 import torch
@@ -34,6 +35,13 @@ class ECGPretrainModel(nn.Module):
             dim_latent=256,
             text_pad_id=self.text_encoder.tokenizer.pad_token_id,
         )
+
+        fixed_temperature = getattr(config, "temperature", None)
+        if fixed_temperature is not None:
+            logit_scale = math.log(1 / fixed_temperature)
+            with torch.no_grad():
+                self.clip.temperature.fill_(logit_scale)
+            self.clip.temperature.requires_grad = False
 
     def forward(self, ecg, input_ids):
         # CLIP内部会根据text_pad_id自动计算mask (text_mask = text != pad_token_id)

@@ -2,6 +2,7 @@ import torch
 from tqdm import tqdm
 import numpy as np
 from sklearn.metrics import roc_auc_score
+from torch.cuda.amp import autocast
 
 
 class Trainer:
@@ -60,7 +61,7 @@ class Trainer:
 
             # 使用混合精度训练
             if scaler is not None:
-                with torch.amp.autocast("cuda"):
+                with autocast():
                     logits = self.model(ecg)
                     total_loss = self.criterion(logits, labels)
 
