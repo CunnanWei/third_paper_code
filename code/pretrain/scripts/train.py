@@ -257,6 +257,7 @@ def _run_training_with_config(config=None):
                     "val/ecg_to_text_top1": val_metrics["image_to_text_top1"],
                     "val/ecg_to_text_top5": val_metrics["image_to_text_top5"],
                     "val/mean_recall": val_metrics["mean_recall"],
+                    "lr": optimizer.param_groups[0]["lr"],
                 }
             )
 

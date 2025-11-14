@@ -3,7 +3,6 @@ import torch.nn.functional as F
 import torch.nn as nn
 import torch
 from pathlib import Path
-from mamba_ssm import Mamba2
 
 import sys
 sys.path.append(str(Path(__file__).resolve().parent))
