@@ -29,6 +29,17 @@ def set_seed(seed):
         torch.cuda.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)
 
+def load_pretrained_backbone(model, pretrained_path):
+    state_dict = torch.load(pretrained_path, map_location="cpu")
+    if isinstance(state_dict, dict) and "state_dict" in state_dict:
+        state_dict = state_dict["state_dict"]
+    backbone_state = {}
+    for k, v in state_dict.items():
+        if k.startswith("ecg_encoder."):
+            backbone_state[k.replace("ecg_encoder.", "model.")] = v
+    missing, unexpected = model.load_state_dict(backbone_state, strict=False)
+    print(f"  Loaded pretrained backbone from: {pretrained_path}")
+    print(f"  Missing keys: {len(missing)} | Unexpected keys: {len(unexpected)}")
 
 def main(dataset_name):
     print("\n" + "=" * 60)
@@ -87,11 +98,21 @@ def main(dataset_name):
         num_classes=train_dataset.num_classes
     )
 
-    optimizer = torch.optim.AdamW(
-        model.parameters(), lr=config.lr_rate, weight_decay=config.weight_decay
-    )
+    if config.linear_eval:
+        load_pretrained_backbone(model, config.pretrain_weights)
+        for p in model.model.parameters():
+            p.requires_grad = False
+        optimizer = torch.optim.AdamW(
+            model.fc.parameters(), lr=config.lr_rate, weight_decay=config.weight_decay
+        )
+        print("  Linear evaluation: backbone frozen, training classifier head only")
+    else:
+        optimizer = torch.optim.AdamW(
+            model.parameters(), lr=config.lr_rate, weight_decay=config.weight_decay
+        )
+        print("  Full finetuning: all parameters trainable")
 
-    num_epochs = 85
+    num_epochs = 50
     warmup_epochs = 5
 
     num_batches_per_epoch = len(train_loader)
@@ -241,9 +262,9 @@ if __name__ == "__main__":
     dataset_name = [
         'ptbxl-form',
         'ptbxl-rhythm',
-        # 'ptbxl-super',
+        'ptbxl-super',
         'ptbxl-sub',
-        # 'chapman',
+        'chapman',
         'icbeb',
     ]
     for name in dataset_name:

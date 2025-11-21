@@ -16,7 +16,7 @@ class ECGDataset_pretrain(Dataset):
         elif self.mode == "val":
             self.csv_path = f"{config.data_prefix_root}/pretrain/val.csv"
 
-        self.csv_data = pd.read_csv(self.csv_path, usecols=['path', 'report_tokenize_path'])
+        self.csv_data = pd.read_csv(self.csv_path, usecols=['path', 'report_tokenize_path'])  # type: ignore
 
     def __len__(self):
         return len(self.csv_data)

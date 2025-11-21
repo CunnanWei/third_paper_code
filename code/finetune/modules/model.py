@@ -5,7 +5,7 @@ from pathlib import Path
 sys.path.append(str(Path(__file__).resolve().parent))
 sys.path.append(str(Path(__file__).resolve().parent / "layers" / "Vim" / "mamba-1p1p1"))
 from layers.MedMamba import medmamba_t, medmamba_s, medmamba_b
-
+from layers.resnet1d import ResNet18
 class ECGModel(nn.Module):
 
     def __init__(
@@ -15,17 +15,17 @@ class ECGModel(nn.Module):
         super().__init__()
 
 
-        self.model = medmamba_t(
-            patch_size=5,
-            d_state=32,
-            in_chans=num_leads,
-            num_classes=num_classes,
+        self.model = ResNet18(
+            # patch_size=5,
+            # d_state=32,
+            # in_chans=num_leads,
+            num_classes=256,
         )
-
+        self.fc = nn.Linear(256, num_classes)
     def forward(self, x):
 
         logits = self.model(x)
-
+        logits = self.fc(logits)
         return logits
 
 

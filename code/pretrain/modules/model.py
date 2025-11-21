@@ -10,7 +10,7 @@ sys.path.append(str(Path(__file__).resolve().parent / "layers" / "x_clip"))
 from layers.x_clip.x_clip import CLIP
 from layers.text_encoder import TextEncoder
 # from layers.timesformer_pytorch.timesformer_pytorch import TimeSformer
-# from layers.resnet1d import ResNet18
+from layers.resnet1d import ResNet18
 from layers.MedMamba import medmamba_t, medmamba_s, medmamba_b
 
 class ECGPretrainModel(nn.Module):
@@ -18,7 +18,7 @@ class ECGPretrainModel(nn.Module):
         super().__init__()
         self.config = config
 
-        self.ecg_encoder = medmamba_t(
+        self.ecg_encoder = medmamba_s(
             patch_size=5,
             d_state=16,
             in_chans=12,

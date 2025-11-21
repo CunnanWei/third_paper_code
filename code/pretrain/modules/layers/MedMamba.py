@@ -113,7 +113,7 @@ class SS1D(nn.Module):
             padding=(d_conv - 1) // 2,
             **factory_kwargs,
         )
-        self.act = nn.SiLU()
+        self.act = nn.SiLU() 
 
         self.x_proj = (
             nn.Linear(self.d_inner, (self.dt_rank + self.d_state * 2), bias=False, **factory_kwargs), 

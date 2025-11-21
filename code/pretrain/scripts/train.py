@@ -54,7 +54,8 @@ def _run_training_with_config(config=None):
         print("\n" + "=" * 60)
         print(f"{'Model Training Pipeline':^60}")
         print("=" * 60)
-    seed = 42
+    seed_base = config.seed
+    seed = seed_base + rank if use_distributed else seed_base
     set_seed(seed)
     save_prefix = f"{str(datetime.now().strftime('%Y%m%d_%H%M%S'))}"
     swanlab_run = None
@@ -90,12 +91,14 @@ def _run_training_with_config(config=None):
     train_sampler = DistributedSampler(
         train_dataset,
         shuffle=True,
+        seed=seed,
     ) if use_distributed else None
 
     # 为验证集也添加DistributedSampler，确保DDP模式下每个进程验证不同的数据子集
     val_sampler = DistributedSampler(
         val_dataset,
         shuffle=False,  # 验证时不需要shuffle
+        seed=seed,
     ) if use_distributed else None
 
     train_loader = DataLoader(
@@ -119,7 +122,7 @@ def _run_training_with_config(config=None):
         num_workers=num_workers,
         persistent_workers=True,
         prefetch_factor=8,
-        drop_last=True,  # DDP模式下保持各进程batch数量一致
+        drop_last=False,  
     )
 
     if is_main_process:
@@ -209,9 +212,6 @@ def _run_training_with_config(config=None):
         # 为训练sampler设置epoch，确保每个epoch数据分布不同
         if train_sampler is not None:
             train_sampler.set_epoch(epoch)
-        # 为验证sampler也设置epoch，保证DDP模式下数据分片的确定性
-        if val_sampler is not None:
-            val_sampler.set_epoch(epoch)
         if is_main_process:
             print(f"\nEpoch {epoch + 1}/{num_epochs}")
 
@@ -265,10 +265,6 @@ def _run_training_with_config(config=None):
         if epoch == 0 and is_main_process:
             os.makedirs(model_dir, exist_ok=True)
             print(f"Model snapshot directory created: {model_dir}")
-
-        # 确保目录创建完成后再继续
-        if use_distributed:
-            dist.barrier()
 
         # 使用 Mean Recall 作为主要指标（对比学习准确率）
         current_mean_recall = val_metrics['mean_recall']
